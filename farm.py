@@ -177,7 +177,9 @@ def cmd_reg(a):
     script = "grok_auto.py" if os.path.exists(os.path.join(reg, "grok_auto.py")) else "grok_register_ttk.py"
     email_provider = os.getenv("EMAIL_PROVIDER", CFG["email"]["provider"])
     cmd = [py, script, "--count", str(a.count), "--email-provider", email_provider]
-    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    if script == "grok_auto.py":
+        cmd += ["--threads", str(a.threads)]  # не полагаться на stdin-хендшейк с input()
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")  # логи в реальном времени
     # proxy from config -> GROK_PROXY
     if CFG["proxy"]["mode"] == "single" and CFG["proxy"]["single"]:
         env["GROK_PROXY"] = CFG["proxy"]["single"]

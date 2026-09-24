@@ -28,7 +28,7 @@ PROXIES = {
 config = {
     "site_key": "0x4AAAAAAAhr9JGVDZbrZOo0",
     "action_id": None,
-    "state_tree": "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fsign-up%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
+    "state_tree": "",  # извлекается из живой страницы при init; пустой = не слать заголовок
 }
 
 post_lock = threading.Lock()
@@ -187,7 +187,7 @@ def register_single_thread(email_provider: str = "gptmail"):
                     headers = {
                         "user-agent": user_agent, "accept": "text/x-component", "content-type": "text/plain;charset=UTF-8",
                         "origin": site_url, "referer": f"{site_url}/sign-up", "cookie": f"__cf_bm={session.cookies.get('__cf_bm','')}",
-                        "next-router-state-tree": config["state_tree"],
+                        "next-router-state-tree": config.get("state_tree") or "",  # заголовок ОБЯЗАТЕЛЕН (даже пустой): без него POST принимается за form-submit -> RSC 404
                     }
                     if final_action_id:
                         headers["next-action"] = final_action_id
@@ -236,8 +236,13 @@ def register_single_thread(email_provider: str = "gptmail"):
                         # 判断：如果响应中包含明确的 invalid-code 错误才是真失败
                         if '"error"' in res.text and 'invalid' in res.text.lower():
                             if not sso:
-                                _err = re.search(r'\{[^{}]*"error"[^{}]*\}', res.text)
-                                print(f"[-] {email} ошибка регистрации: {(_err.group(0)[:250] if _err else res.text[:250])}")
+                                _i = res.text.find('"error"')
+                                _snip = res.text[max(0, _i - 80):_i + 400] if _i >= 0 else res.text[:400]
+                                try:
+                                    open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_last_response.txt"), "w", encoding="utf-8").write(res.text)
+                                except Exception:
+                                    pass
+                                print(f"[-] {email} ошибка регистрации: {_snip}")
                             # 如果有 sso 还是算成功（响应格式混乱时）
 
                         if sso:
