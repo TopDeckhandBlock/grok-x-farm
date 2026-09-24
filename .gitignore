@@ -1,0 +1,35 @@
+# secrets
+SECRETS.local.txt
+g2a_key.txt
+imported_sso.txt
+farm.config.json
+.env
+*.session
+keys/
+auths/
+accounts*.txt
+sso_risk_rejected.txt
+farm.secrets.json
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# build
+*.exe
+grok2api/
+grok-register/
+grok-auto/
+*.log
+data/
+
+# panel/crawl runtime artifacts (root only)
+/dashboard/logs/
+/seen*.json
+/panel_seen.json
+/panel_out.json
+/tweets*.json
+/smoke/
+ai_abuse_*.json
+ai_abuse_*.txt

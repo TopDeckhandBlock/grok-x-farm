@@ -1,0 +1,78 @@
+# docker-compose.grok.yml — "newapi для grok": new-api панель + grok2api пул
+#
+# Архитектура:
+#   client -> new-api (:3000, панель/ключи/квоты/биллинг)
+#               -> channel "grok" -> grok2api (:8000, пул grok-аккаунтов)
+#                                       -> xAI API (grok-4.6/4.7/chat-fast)
+#
+# Деплой: docker compose -f docker-compose.grok.yml up -d
+# new-api панель: http://SERVER_IP:3000 (root/123456 — СМЕНИТЬ сразу!)
+# grok2api: только внутренняя сеть (127.0.0.1:8000), наружу не торчит
+#
+# RAM: ~600MB (new-api SQLite ~150MB + grok2api ~400MB). Влезает в 1GB, комфортно в 2GB.
+
+services:
+  grok2api:
+    image: ghcr.io/chenyme/grok2api:latest
+    container_name: grok2api
+    restart: always
+    ports:
+      - "127.0.0.1:8000:8000"        # только локально — new-api проксирует наружу
+    volumes:
+      - ./grok2api/config.yaml:/app/config.yaml:ro
+      - grok2api_data:/app/data
+    environment:
+      - TZ=Europe/Berlin
+    networks:
+      - grok-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  new-api:
+    image: calciumion/new-api:latest
+    container_name: new-api
+    restart: always
+    command: --log-dir /app/logs
+    ports:
+      - "3000:3000"                    # публичная панель + API
+    volumes:
+      - ./new-api/data:/data
+      - ./new-api/logs:/app/logs
+    environment:
+      # SQL_DSN пустой -> SQLite (экономия RAM; для продакшена >1k юзеров -> PostgreSQL)
+      - SQL_DSN=
+      - TZ=Europe/Berlin
+      - NODE_NAME=grok-eu-1
+      - ERROR_LOG_ENABLED=true
+      - BATCH_UPDATE_ENABLED=true
+      # - SESSION_SECRET=<random>      # раскомментить для multi-node
+      - STREAMING_TIMEOUT=300          # grok reasoning может быть медленным
+    depends_on:
+      grok2api:
+        condition: service_healthy
+    networks:
+      - grok-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/status | grep -o '\"success\":\\s*true' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  grok-net:
+    driver: bridge
+
+volumes:
+  grok2api_data:
+
+# ПОСЛЕ запуска — добавить канал в new-api (панель :3000 -> Channels -> Add):
+#   Type:     OpenAI
+#   Name:     grok-pool
+#   Base URL: http://grok2api:8000
+#   Key:      g2a_xxx  (client key из grok2api admin -> Client Keys)
+#   Models:   grok-4.6, grok-4.7, grok-4.5, grok-chat-fast, grok-composer-2.5-fast
+#   Group:    default
+# Затем в Token -> Add создать клиентский ключ new-api (sk-xxx) для потребителей.

@@ -1,0 +1,95 @@
+{
+  "//": "grok-x-farm unified config. Copy to farm.config.json and edit. All secrets can also come from env vars (they win over this file).",
+  "farm": {
+    "count_per_run": 5,
+    "threads": 1,
+    "//threads": "1-2 max: Turnstile serializes on shared browser",
+    "delay_between_accounts_sec": [
+      8,
+      25
+    ],
+    "auto_import_to_gateway": true,
+    "auto_convert_to_build": true
+  },
+  "email": {
+    "provider": "tmail",
+    "//provider": "tmail | luckmail | mailnest | fce | gptmail | gmail | outlook. fce = pure API no browser. gmail = +alias from one base mailbox. tmail/gptmail need headed Chrome.",
+    "tmail": {},
+    "luckmail": {
+      "api_key_env": "LUCKMAIL_API_KEY",
+      "api_secret_env": "LUCKMAIL_API_SECRET",
+      "project_code": "",
+      "domain": ""
+    },
+    "mailnest": {
+      "api_key_env": "MAILNEST_API_KEY",
+      "project_code": "x-ai001"
+    },
+    "fce": {
+      "api_key_env": "FCE_API_KEY"
+    },
+    "gmail": {
+      "base_email": "",
+      "app_password_env": "GMAIL_APP_PASSWORD",
+      "//": "uses +alias derivatives of base_email via IMAP"
+    },
+    "outlook": {
+      "accounts_file": "./mailboxes/outlook-accounts.txt",
+      "//": "line format: email----password----clientId----refreshToken----auto"
+    }
+  },
+  "captcha": {
+    "mode": "free_browser",
+    "//mode": "free_browser (patchright + turnstile.render, default, $0) | yescaptcha | capsolver | nopecha | 2captcha — paid solver fallback when free solver starts failing; first provider in fallback_order with a key wins",
+    "yescaptcha_key_env": "YESCAPTCHA_KEY",
+    "turnstile_sitekey": "0x4AAAAAAAhr9JGVDZbrZOo0",
+    "fallback_after_n_failures": 3,
+    "fallback_order": [
+      "yescaptcha",
+      "capsolver",
+      "nopecha",
+      "2captcha"
+    ],
+    "capsolver_key_env": "CAPSOLVER_KEY",
+    "nopecha_key_env": "NOPETCHA_KEY",
+    "twocaptcha_key_env": "TWOCAPTCHA_KEY",
+    "solver_timeout_sec": 70,
+    "retry_per_solver": 2
+  },
+  "proxy": {
+    "mode": "direct",
+    "//mode": "direct | single | pool",
+    "single": "",
+    "//single": "http://user:pass@host:port — REQUIRED non-RU geo (xAI geo-blocks RU egress)",
+    "pool_file": "./proxies.txt",
+    "geo_whitelist": [
+      "US",
+      "EU"
+    ],
+    "healthcheck_url": "http://ip-api.com/json/?fields=status,countryCode,query,isp"
+  },
+  "gateway": {
+    "base_url": "http://127.0.0.1:8000",
+    "admin_user": "admin",
+    "admin_pass_env": "G2A_ADMIN_PASS",
+    "admin_pass_file": "./SECRETS.local.txt",
+    "client_key_env": "G2A_KEY",
+    "client_key_file": "./g2a_key.txt",
+    "parse_model": "grok-chat-fast",
+    "//parse_model": "Web pool — the ONLY model with native live X search",
+    "reasoning_model": "grok-4.7",
+    "tool_model": "grok-4.7",
+    "rpm_limit": 120,
+    "max_concurrent": 8
+  },
+  "parser": {
+    "posts_per_query": 15,
+    "days_window": 14,
+    "delay_between_queries_sec": 3,
+    "retry_attempts": 3,
+    "retry_backoff_sec": 5,
+    "dedup_by": "tweet_id",
+    "verify_sample_size": 10,
+    "verify_via": "api.fxtwitter.com"
+  }
+}
