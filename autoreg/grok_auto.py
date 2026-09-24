@@ -143,7 +143,7 @@ def register_single_thread(email_provider: str = "gptmail"):
                         # 兼容新格式："SZ0-0SW xAI confirmation code" 以及 HTML 中的 "SZ0-0SW"
                         match = re.search(r"([A-Z0-9]{3}-[A-Z0-9]{3})", content)
                         if match:
-                            verify_code = match.group(1).replace("-", "")
+                            verify_code = match.group(1)  # x.ai требует код С дефисом (ABC-DEF), не stripped
                             break
                 if not verify_code:
                     print(f"[-] {email} код подтверждения не получен")
@@ -236,7 +236,8 @@ def register_single_thread(email_provider: str = "gptmail"):
                         # 判断：如果响应中包含明确的 invalid-code 错误才是真失败
                         if '"error"' in res.text and 'invalid' in res.text.lower():
                             if not sso:
-                                print(f"[-] {email} неверный код подтверждения: {res.text[:150]}")
+                                _err = re.search(r'\{[^{}]*"error"[^{}]*\}', res.text)
+                                print(f"[-] {email} ошибка регистрации: {(_err.group(0)[:250] if _err else res.text[:250])}")
                             # 如果有 sso 还是算成功（响应格式混乱时）
 
                         if sso:

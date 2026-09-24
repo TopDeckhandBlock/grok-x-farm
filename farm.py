@@ -173,6 +173,7 @@ def cmd_reg(a):
     reg = find_reg_dir()
     py = os.path.join(reg, ".venv", "Scripts", "python.exe")
     if not os.path.exists(py): py = os.path.join(reg, ".venv", "bin", "python")
+    if not os.path.exists(py): py = sys.executable  # no venv -> current Python (Python311 has deps)
     script = "grok_auto.py" if os.path.exists(os.path.join(reg, "grok_auto.py")) else "grok_register_ttk.py"
     email_provider = os.getenv("EMAIL_PROVIDER", CFG["email"]["provider"])
     cmd = [py, script, "--count", str(a.count), "--email-provider", email_provider]
