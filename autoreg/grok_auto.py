@@ -1,22 +1,19 @@
 import os, json, random, string, time, re, struct, argparse
-import queue
 import threading
 import concurrent.futures
 import sys
 from urllib.parse import urljoin, urlparse
-
-import ca_fix  # noqa: F401 — ASCII CA-бандл для кириллических путей (curl error 77)
 from curl_cffi import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 load_dotenv()
 
-from email_service import EmailService, mark_bad_email_domain, bad_email_domains
-from turnstile_farm import TurnstileFarm
+from email_service import EmailService
+from grok_free import browser_init, solve_turnstile
 
 # 基础配置
 site_url = "https://accounts.x.ai"
@@ -34,44 +31,18 @@ config = {
     "state_tree": "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fsign-up%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
 }
 
-submit_limiter = None           # PaceLimiter: мин. интервал между сабмитами (инициализируется в main)
+post_lock = threading.Lock()
 file_lock = threading.Lock()
 count_lock = threading.Lock()
 stop_event = threading.Event()
-# Turnstile-ферма: ОДИН браузер на весь прогон, пачка виджетов за цикл,
-# готовые токены в очереди — капча перестаёт быть серийным замком.
-ts_farm = None  # инициализируется в main() после подготовки config
-# CPA-конвертация уходит в фон: поток регистрации не ждёт 10–20 с на аккаунт.
-cpa_queue = queue.Queue()
+# Free Turnstile: одна общая DrissionPage-страница на весь запуск (паттерн из grok_free.py)
+ts_lock = threading.Lock()
+ts_page = None
 success_count = 0
 completed_count = 0
 target_count = 0  # 0 = 无限
 start_time = time.time()
 EMAIL_PROVIDER = str(os.getenv("EMAIL_PROVIDER") or "luckmail").strip().lower()
-
-# Адаптивный опрос почты (из v2): первый заход через 2с — коды часто приходят
-# быстро; нарастающие паузы; суммарное окно ~110с вместо 59с у v4.
-MAIL_POLL_SCHEDULE = [2, 2, 3, 3, 4, 5, 6, 7, 8, 10, 12, 15, 15, 18]
-
-
-class PaceLimiter:
-    """Минимальный интервал между POST /sign-up глобально (анти-rate-limit).
-    В отличие от post_lock v4 — не держит блокировку на время запроса."""
-
-    def __init__(self, interval: float):
-        self.interval = max(0.0, float(interval))
-        self._lock = threading.Lock()
-        self._next = 0.0
-
-    def wait(self):
-        if self.interval <= 0:
-            return
-        with self._lock:
-            now = time.monotonic()
-            delay = self._next - now
-            self._next = max(self._next, now) + self.interval
-        if delay > 0:
-            time.sleep(delay)
 
 def generate_random_name() -> str:
     length = random.randint(4, 6)
@@ -119,43 +90,7 @@ def verify_email_code_grpc(session, email, code):
         print(f"[-] {email} ошибка проверки кода: {e}")
         return False
 
-def cpa_worker():
-    """Фоновая конвертация SSO → CPA: не блокирует поток регистрации."""
-    while True:
-        item = cpa_queue.get()
-        if item is None:
-            cpa_queue.task_done()
-            return
-        sso, email = item
-        try:
-            from sso_to_cpa import sso_to_cpa as _sso2cpa, save_auth as _save_cpa
-            _cpa = _sso2cpa(sso, email)
-            if _cpa:
-                _save_cpa(email, _cpa)
-                print(f"[OK] {email} CPA-токен сохранён в auths/")
-            else:
-                print(f"[-] {email} конвертация CPA не удалась (SSO сохранён, догонка: sso_to_cpa.py --all)")
-        except Exception as _cpa_e:
-            print(f"[-] {email} исключение при конвертации CPA: {_cpa_e}")
-        finally:
-            cpa_queue.task_done()
-
-def stats_worker():
-    """Одна строка каждые 30с: успехи, темп акк/час, ферма, очереди."""
-    while not stop_event.wait(30):
-        with count_lock:
-            ok, comp = success_count, completed_count
-        el = max(1e-9, time.time() - start_time)
-        rate = 3600 * ok / el if ok else 0.0
-        tq = ts_farm.tokens.qsize() if ts_farm else 0
-        ts_tot = ts_farm.solved_total if ts_farm else 0
-        dead_mark = " (МЕРТВА!)" if (ts_farm and ts_farm.dead.is_set()) else ""
-        print(f"[stats] ok={ok} прогресс={comp}/{target_count or 'безлимит'} "
-              f"темп≈{rate:.0f} акк/ч | TS: очередь {tq}, всего {ts_tot}{dead_mark} | "
-              f"CPA-очередь: {cpa_queue.qsize()} | blacklist доменов: {len(bad_email_domains())}")
-
 def register_single_thread(email_provider: str = "gptmail"):
-    global success_count, completed_count
     # 错峰启动，防止瞬时并发过高
     time.sleep(random.uniform(0, 5))
 
@@ -171,171 +106,185 @@ def register_single_thread(email_provider: str = "gptmail"):
         print("[-] поток завершён: не найден Action ID")
         return
 
-    session = None  # сессия воркера живёт между аккаунтами (экономия TLS-хендшейков)
     while not stop_event.is_set():
-        # ферма обновляет action_id из живой страницы — подхватываем свежий
-        final_action_id = config.get("action_id") or final_action_id
         jwt = None
         try:
-            if session is None:
-                session = requests.Session(impersonate="chrome120", proxies=PROXIES)
-            # чистые куки на каждый аккаунт + 预热: свежий __cf_bm
-            session.cookies.clear()
-            try: session.get(site_url, timeout=10)
-            except: pass
+            with requests.Session(impersonate="chrome120", proxies=PROXIES) as session:
+                # 预热连接
+                try: session.get(site_url, timeout=10)
+                except: pass
 
-            password = generate_random_string()
+                password = generate_random_string()
+                
+                # print(f"[debug] 线程-{threading.get_ident()} 正在请求创建邮箱...")
+                try:
+                    jwt, email = email_service.create_email()
+                except Exception as e:
+                    print(f"[-] ошибка email-сервиса: {e}")
+                    jwt, email = None, None
 
-            try:
-                jwt, email = email_service.create_email()
-            except Exception as e:
-                print(f"[-] ошибка email-сервиса: {e}")
-                jwt, email = None, None
+                if not email:
+                    print(f"[-] поток-{threading.get_ident()} создание email вернуло пусто (API недоступен или таймаут), жду 5 с...")
+                    time.sleep(5); continue
+                
+                print(f"[*] регистрация: {email}")
 
-            if not email:
-                print(f"[-] поток-{threading.get_ident()} создание email вернуло пусто (API недоступен или таймаут), жду 5 с...")
-                time.sleep(5); continue
-
-            print(f"[*] регистрация: {email}")
-
-            # Step 1: 发送验证码
-            if not send_email_code_grpc(session, email):
-                print(f"[-] {email} не удалось отправить код подтверждения")
-                time.sleep(5); continue
-
-            # Step 2: адаптивный опрос ящика (первый заход 2с, окно ~110с)
-            verify_code = None
-            for _pause in MAIL_POLL_SCHEDULE:
-                time.sleep(_pause)
-                if stop_event.is_set():
-                    break   # цель достигнута — не дожариваем окно опроса
-                content = email_service.fetch_first_email(jwt)
-                if content:
-                    # 兼容新格式："SZ0-0SW xAI confirmation code" 以及 HTML 中的 "SZ0-0SW"
-                    match = re.search(r"([A-Z0-9]{3}-[A-Z0-9]{3})", content)
-                    if match:
-                        verify_code = match.group(1).replace("-", "")
-                        break
-            if not verify_code:
-                if stop_event.is_set():
-                    continue    # не фейл домена: просто прогон остановлен
-                print(f"[-] {email} код подтверждения не получен")
-                mark_bad_email_domain(email)  # счётчик фейлов; blacklist после 2-го
-                continue
-
-            # Step 3: токен Turnstile из фермы; ферма мертва — сворачиваем прогон
-            if ts_farm is not None and ts_farm.dead.is_set():
-                print("[-] Turnstile-ферма мертва — прогон остановлен")
-                stop_event.set()
-                break
-            ts_token = ts_farm.get_token(timeout=180) if ts_farm else None
-            if not ts_token:
-                print(f"[-] {email} капча не решена (ферма пуста/таймаут)")
-                if ts_farm is not None and ts_farm.dead.is_set():
-                    stop_event.set()
-                    break
-                continue
-
-            # Step 4: 直接提交注册（跳过预验证，避免消耗验证码）
-            headers = {
-                "user-agent": user_agent, "accept": "text/x-component", "content-type": "text/plain;charset=UTF-8",
-                "origin": site_url, "referer": f"{site_url}/sign-up", "cookie": f"__cf_bm={session.cookies.get('__cf_bm','')}",
-                "next-router-state-tree": config["state_tree"],
-            }
-            if final_action_id:
-                headers["next-action"] = final_action_id
-            payload = [{
-                "emailValidationCode": verify_code,
-                "createUserAndSessionRequest": {
-                    "email": email, "givenName": generate_random_name(), "familyName": generate_random_name(),
-                    "clearTextPassword": password, "tosAcceptedVersion": "$undefined"
-                },
-                "turnstileToken": ts_token, "promptOnDuplicateEmail": True
-            }]
-
-            # pacing: минимальный интервал между сабмитами (без жёсткого замка на запрос)
-            if submit_limiter is not None:
-                submit_limiter.wait()
-            res = session.post(f"{site_url}/sign-up", json=payload, headers=headers)
-
-            if res.status_code == 200:
-                # 尝试多种 SSO 提取方式
-                sso = None
-                # 方式1: set-cookie?q= URL (老格式)
-                for pat in [
-                    r'(https://[^"\s]+set-cookie\?q=[^:"\s]+)',
-                    r'(https://[^"\s]+set-cookie[^"\s]+)',
-                ]:
-                    m = re.search(pat, res.text)
-                    if m:
-                        sso_url = m.group(0).rstrip("1:").rstrip("2:").rstrip("3:")
-                        try:
-                            session.get(sso_url, allow_redirects=True, timeout=15)
-                        except:
-                            pass
-                        sso = session.cookies.get("sso")
-                        if sso:
+                # Step 1: 发送验证码
+                if not send_email_code_grpc(session, email):
+                    print(f"[-] {email} не удалось отправить код подтверждения")
+                    time.sleep(5); continue
+                
+                # Step 2: 获取验证码
+                verify_code = None
+                for _ in range(12):
+                    time.sleep(5)
+                    content = email_service.fetch_first_email(jwt)
+                    if content:
+                        # 兼容新格式："SZ0-0SW xAI confirmation code" 以及 HTML 中的 "SZ0-0SW"
+                        match = re.search(r"([A-Z0-9]{3}-[A-Z0-9]{3})", content)
+                        if match:
+                            verify_code = match.group(1).replace("-", "")
                             break
-                # 方式2: 直接从 response cookies 取
-                if not sso:
-                    sso = session.cookies.get("sso")
-                # 方式3: 检查 Set-Cookie header
-                if not sso:
-                    set_cookie = res.headers.get("set-cookie", "")
-                    for c in set_cookie.split(","):
-                        if "sso=" in c:
-                            sso_val = c.split("sso=")[1].split(";")[0]
-                            if sso_val:
-                                sso = sso_val
-                                break
-                # 判断：如果响应中包含明确的 invalid-code 错误才是真失败
-                if '"error"' in res.text and 'invalid' in res.text.lower():
-                    if not sso:
-                        print(f"[-] {email} неверный код подтверждения: {res.text[:150]}")
-                    # 如果有 sso 还是算成功（响应格式混乱时）
+                if not verify_code:
+                    print(f"[-] {email} код подтверждения не получен")
+                    continue
 
-                if sso:
-                    with file_lock:
-                        os.makedirs("keys", exist_ok=True)
-                        with open("keys/grok.txt", "a") as f: f.write(sso + "\n")
-                        with open("keys/accounts.txt", "a") as f: f.write(f"{email}:{password}:{sso}\n")
-                        success_count += 1
-                        completed_count += 1
-                        avg = (time.time() - start_time) / success_count
+                # Step 3: 先解 Turnstile（最耗时），避免验证码过期
+                # Free bypass: DrissionPage manual render (тот же путь, что в grok_free.py)
+                global ts_page
+                ts_token = None
+                with ts_lock:
+                    for ts_attempt in range(3):
+                        try:
+                            if ts_page is None:
+                                print(f"[*] {email} запускаю браузер Turnstile...")
+                                _bi = browser_init()
+                                ts_page = _bi["page"]
+                                if _bi.get("site_key"):
+                                    config["site_key"] = _bi["site_key"]
+                                if _bi.get("action_id"):
+                                    config["action_id"] = _bi["action_id"]
+                                    final_action_id = config["action_id"]
+                                if _bi.get("state_tree"):
+                                    config["state_tree"] = _bi["state_tree"]
+                            ts_token = solve_turnstile(ts_page, config["site_key"])
+                        except Exception as e:
+                            ts_token = None
+                            print(f"[-] {email} ошибка браузера Turnstile: {e}")
+                            try: ts_page.quit()
+                            except Exception: pass
+                            ts_page = None
+                        if ts_token:
+                            break
+                        print(f"[-] {email} капча не решена, повторяю...")
+                        time.sleep(2)
+                if not ts_token:
+                    print(f"[-] {email} капча не решена за все попытки")
+                    continue
 
-                    if target_count > 0 and completed_count >= target_count:
-                        stop_event.set()
+                # Step 4: 直接提交注册（跳过预验证，避免消耗验证码）
+                for attempt in range(1):  # 只试一次，失败换号重来
+                    headers = {
+                        "user-agent": user_agent, "accept": "text/x-component", "content-type": "text/plain;charset=UTF-8",
+                        "origin": site_url, "referer": f"{site_url}/sign-up", "cookie": f"__cf_bm={session.cookies.get('__cf_bm','')}",
+                        "next-router-state-tree": config["state_tree"],
+                    }
+                    if final_action_id:
+                        headers["next-action"] = final_action_id
+                    payload = [{
+                        "emailValidationCode": verify_code,
+                        "createUserAndSessionRequest": {
+                            "email": email, "givenName": generate_random_name(), "familyName": generate_random_name(),
+                            "clearTextPassword": password, "tosAcceptedVersion": "$undefined"
+                        },
+                        "turnstileToken": ts_token, "promptOnDuplicateEmail": True
+                    }]
+                    
+                    with post_lock:
+                        res = session.post(f"{site_url}/sign-up", json=payload, headers=headers)
+                    
+                    if res.status_code == 200:
+                        # 尝试多种 SSO 提取方式
+                        sso = None
+                        # 方式1: set-cookie?q= URL (老格式)
+                        for pat in [
+                            r'(https://[^"\s]+set-cookie\?q=[^:"\s]+)',
+                            r'(https://[^"\s]+set-cookie[^"\s]+)',
+                        ]:
+                            m = re.search(pat, res.text)
+                            if m:
+                                sso_url = m.group(0).rstrip("1:").rstrip("2:").rstrip("3:")
+                                try:
+                                    session.get(sso_url, allow_redirects=True, timeout=15)
+                                except:
+                                    pass
+                                sso = session.cookies.get("sso")
+                                if sso:
+                                    break
+                        # 方式2: 直接从 response cookies 取
+                        if not sso:
+                            sso = session.cookies.get("sso")
+                        # 方式3: 检查 Set-Cookie header
+                        if not sso:
+                            set_cookie = res.headers.get("set-cookie", "")
+                            for c in set_cookie.split(","):
+                                if "sso=" in c:
+                                    sso_val = c.split("sso=")[1].split(";")[0]
+                                    if sso_val:
+                                        sso = sso_val
+                                        break
+                        # 判断：如果响应中包含明确的 invalid-code 错误才是真失败
+                        if '"error"' in res.text and 'invalid' in res.text.lower():
+                            if not sso:
+                                print(f"[-] {email} неверный код подтверждения: {res.text[:150]}")
+                            # 如果有 sso 还是算成功（响应格式混乱时）
 
-                    print(f"[OK] зарегистрирован: {email} | SSO: {sso[:15]}... | среднее: {avg:.1f}с | прогресс: {completed_count}/{target_count if target_count else 'безлимит'}")
-                    # полная строка для машинного парсинга (auto_replenish.py)
-                    print(f"[SSO] {email} {sso}")
-                    # CPA конвертируется фоновым воркером (cpa_worker),
-                    # поток регистрации сразу берёт следующий аккаунт
-                    cpa_queue.put((sso, email))
-                elif '"error"' not in res.text or 'invalid' not in res.text.lower():
-                    # 无明显错误但也没 SSO，打印更多信息调试
-                    print(f"[-] {email} нет SSO (200 OK, len={len(res.text)}): {res.text[:150]}")
-                # else: 有 invalid 错误且无 SSO，已在上面的 if 打印
-            else:
-                print(f"[-] {email} отправка не удалась ({res.status_code}): {res.text[:200]}")
-                if res.status_code in (403, 503):
-                    # CF/сервер порвали сессию — следующая итерация создаст новую
-                    try: session.close()
-                    except Exception: pass
-                    session = None
-            time.sleep(1)
+                        if sso:
+                            with file_lock:
+                                os.makedirs("keys", exist_ok=True)
+                                with open("keys/grok.txt", "a") as f: f.write(sso + "\n")
+                                with open("keys/accounts.txt", "a") as f: f.write(f"{email}:{password}:{sso}\n")
+                                global success_count, completed_count
+                                success_count += 1
+                                completed_count += 1
+                                avg = (time.time() - start_time) / success_count
+
+                            if target_count > 0 and completed_count >= target_count:
+                                stop_event.set()
+
+                            print(f"[OK] зарегистрирован: {email} | SSO: {sso[:15]}... | среднее: {avg:.1f}с | прогресс: {completed_count}/{target_count if target_count else 'безлимит'}")
+
+                            # → сразу конвертируем SSO в CPA (auths/xai-*.json), без отдельного прогона sso_to_cpa
+                            try:
+                                from sso_to_cpa import sso_to_cpa as _sso2cpa, save_auth as _save_cpa
+                                print(f"[*] {email} конвертирую SSO -> CPA...")
+                                _cpa = _sso2cpa(sso, email)
+                                if _cpa:
+                                    _save_cpa(email, _cpa)
+                                    print(f"[OK] {email} CPA-токен сохранён в auths/")
+                                else:
+                                    print(f"[-] {email} конвертация CPA не удалась (SSO сохранён, можно повторить через sso_to_cpa --all)")
+                            except Exception as _cpa_e:
+                                print(f"[-] {email} исключение при конвертации CPA: {_cpa_e}")
+                            break
+                        elif '"error"' not in res.text or 'invalid' not in res.text.lower():
+                            # 无明显错误但也没 SSO，打印更多信息调试
+                            print(f"[-] {email} нет SSO (200 OK, len={len(res.text)}): {res.text[:150]}")
+                        # else: 有 invalid 错误且无 SSO，已在上面的 if 打印
+                    else:
+                        print(f"[-] {email} отправка не удалась ({res.status_code}): {res.text[:200]}")
+                    time.sleep(2)
+                else:
+                    print(f"[-] {email} сдаюсь, переключаю аккаунт")
+                    time.sleep(5)
 
         except Exception as e:
-            # 捕获所有异常防止线程退出; сетевой сбой → новая сессия
+            # 捕获所有异常防止线程退出
             print(f"[-] исключение: {str(e)[:50]}")
             time.sleep(5)
-            try:
-                if session is not None: session.close()
-            except Exception: pass
-            session = None
         finally:
             # close the provider's browser/client for this attempt
-            # (общий tmail-клиент: close() — no-op, браузер живёт весь прогон)
+            # (Tmail/GPTMail keep a headed Chrome open; Gmail keeps an IMAP session)
             try:
                 if jwt and isinstance(jwt, dict):
                     _client = jwt.get("client")
@@ -346,11 +295,9 @@ def register_single_thread(email_provider: str = "gptmail"):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--email-provider", choices=["gptmail", "luckmail", "mailtm", "gmail", "tmail", "fce", "outlook"], default=os.getenv("EMAIL_PROVIDER", "luckmail"), help="email-провайдер: gptmail/luckmail/mailtm/gmail/tmail/fce/outlook")
+    parser.add_argument("--email-provider", choices=["gptmail", "luckmail", "mailtm", "gmail", "tmail", "fce", "outlook", "imap", "1secmail", "tempmail-lol"], default=os.getenv("EMAIL_PROVIDER", "luckmail"), help="email-провайдер: gptmail/luckmail/mailtm/gmail/tmail/fce/outlook")
     parser.add_argument("--threads", type=int, default=None, help="количество параллельных потоков")
     parser.add_argument("--count", type=int, default=0, help="количество регистраций (0 = безлимит)")
-    parser.add_argument("--cpa-threads", type=int, default=None, help="фоновые воркеры SSO→CPA (дефолт CPA_THREADS из env или 2)")
-    parser.add_argument("--post-interval", type=float, default=None, help="мин. интервал между POST /sign-up, с (дефолт POST_INTERVAL или 2.0)")
     args = parser.parse_args()
 
     global target_count
@@ -423,38 +370,15 @@ def main():
         print("[-] ошибка: Action ID не найден")
         return
 
-    # 2. 启动 (фикс no-TTY: без input(), по умолчанию THREADS из .env или 2)
+    # 2. 启动
     if args.threads is not None:
         t = args.threads
     else:
         try:
-            t = max(1, int(os.getenv("THREADS") or 2))
-        except ValueError:
-            t = 2
-
-    # ферма Turnstile: один браузер на весь прогон (TS_ENGINE: camoufox|drission)
-    global ts_farm, submit_limiter
-    submit_limiter = PaceLimiter(args.post_interval if args.post_interval is not None
-                                 else float(os.getenv("POST_INTERVAL") or 2.0))
-    ts_farm = TurnstileFarm(config)
-    ts_farm.start()
-    print(f"[*] Turnstile-ферма: движок {ts_farm.engine}, батч {ts_farm.batch}, очередь ≤{ts_farm.max_queue}")
-
-    # фоновая CPA-конвертация (не блокирует потоки регистрации)
-    try:
-        n_cpa = args.cpa_threads if args.cpa_threads is not None else int(os.getenv("CPA_THREADS") or 2)
-    except ValueError:
-        n_cpa = 2
-    n_cpa = max(1, n_cpa)
-    _cpa_threads = []
-    for _i in range(n_cpa):
-        _t = threading.Thread(target=cpa_worker, daemon=True, name=f"cpa-worker-{_i}")
-        _t.start()
-        _cpa_threads.append(_t)
-
-    # телеметрия: одна строка каждые 30с
-    threading.Thread(target=stats_worker, daemon=True, name="stats").start()
-
+            t = int(input("\nКоличество потоков (по умолчанию 1): ").strip() or 1)
+        except:
+            t = 1
+    
     print(f"[*] запускаю {t} потоков...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=t) as executor:
         # 只提交与线程数相等的任务，让它们在内部无限循环
@@ -463,27 +387,16 @@ def main():
             concurrent.futures.wait(futures)
         except KeyboardInterrupt:
             print("\n[!] получено прерывание, выходим...")
-            stop_event.set()
 
-    # дожидаемся фоновых CPA-конвертаций: очередь может быть уже пуста,
-    # пока воркер ещё конвертирует взятый элемент — поэтому join, а не только empty()
-    _drain_deadline = time.time() + 300
-    while not cpa_queue.empty() and time.time() < _drain_deadline:
-        time.sleep(2)
-    for _ in _cpa_threads:
-        cpa_queue.put(None)  # sentinel → воркеры завершаются
-    for _t in _cpa_threads:
-        _t.join(timeout=320)  # дать конвертации дописать auths/*.json
-
-    # статистика и остановка фермы (один браузер закрывается в конце)
-    if ts_farm is not None:
+    # закрываем общий браузер Turnstile, если он был открыт
+    global ts_page
+    if ts_page is not None:
         try:
-            _st = ts_farm.stats()
-            print(f"[*] Turnstile-ферма: решено токенов {_st['solved_total']}, в очереди {_st['queue']}")
-            ts_farm.shutdown()
+            ts_page.quit()
             print("[*] браузер Turnstile закрыт")
         except Exception:
             pass
+        ts_page = None
 
 if __name__ == "__main__":
     main()

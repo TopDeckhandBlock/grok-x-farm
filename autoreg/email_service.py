@@ -20,7 +20,6 @@ import threading
 import urllib.parse
 from typing import Any, Dict, List, Optional
 
-import ca_fix  # noqa: F401 — ASCII CA-бандл для кириллических путей
 from curl_cffi import requests
 
 # 标准 requests 用于 mail.tm（避免 curl_cffi TLS 兼容问题）
@@ -395,50 +394,6 @@ class MailNestInbox:
             print(f"не удалось получить письмо MailNest: {e}")
             return None
 
-# домены tmail, куда коды подтверждения не доходят. Blacklist ПОСЛЕ ВТОРОГО
-# фейла: одно медленное письмо ≠ мёртвый домен (ложные срабатывания жгут пул).
-# Список ПЕРСИСТЕНТНЫЙ (bad_domains.txt рядом со скриптом) — переживает
-# перезапуски: мёртвые домены не сжигают циклы на старте каждого прогона.
-_BAD_DOMAINS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "bad_domains.txt")
-
-
-def _load_bad_domains() -> set:
-    try:
-        with open(_BAD_DOMAINS_FILE, encoding="utf-8") as f:
-            return {ln.strip().lower() for ln in f
-                    if ln.strip() and not ln.startswith("#")}
-    except OSError:
-        return set()
-
-
-_TMAIL_BAD_DOMAINS: set = _load_bad_domains()
-_TMAIL_BAD_FAILS: dict = {}
-
-
-def mark_bad_email_domain(email: str):
-    d = (email or "").rsplit("@", 1)[-1].strip().lower()
-    if not d or "@" not in (email or ""):
-        return
-    if d in _TMAIL_BAD_DOMAINS:
-        return
-    _TMAIL_BAD_FAILS[d] = _TMAIL_BAD_FAILS.get(d, 0) + 1
-    if _TMAIL_BAD_FAILS[d] >= 2:
-        _TMAIL_BAD_DOMAINS.add(d)
-        try:
-            with open(_BAD_DOMAINS_FILE, "a", encoding="utf-8") as f:
-                f.write(d + "\n")
-        except OSError:
-            pass
-        print(f"[tmail] домен {d} в чёрном списке (2 фейла доставки кода)")
-    else:
-        print(f"[tmail] домен {d}: код не дошёл ({_TMAIL_BAD_FAILS[d]}/2)")
-
-
-def bad_email_domains() -> list:
-    """Список доменов в чёрном списке (для телеметрии)."""
-    return sorted(_TMAIL_BAD_DOMAINS)
-
 
 class GPTMailInboxV2:
     """GPTMail V2 客户端 — 使用新版 API（2026-07）
@@ -572,18 +527,15 @@ class GPTMailInboxV2:
         return self._domains
 
     def create_email(self) -> str:
-        """在浏览器 контексте调 inbox-token (过 CF 验证), вернуть адрес.
-        Домены из чёрного списка (коды не доходят) отфильтрованы."""
+        """在浏览器上下文里调 inbox-token (过 CF 验证), 返回邮箱地址。"""
         import time as _time
         self._get_page()
         js = """
         async () => {
-            const BAD = __BAD__;
             const dr = await fetch("/api/domains/public");
             const dj = await dr.json();
             const domains = ((dj.data || {}).domains || [])
-                .filter(d => d.is_active && !BAD.includes(d.domain_name))
-                .map(d => d.domain_name);
+                .filter(d => d.is_active).map(d => d.domain_name);
             if (!domains.length) return {err: "no active domains"};
             const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
             let prefix = "";
@@ -600,7 +552,7 @@ class GPTMailInboxV2:
             }
             return {email, token: (j.auth || {}).token || ""};
         }
-        """.replace("__BAD__", json.dumps(sorted(_TMAIL_BAD_DOMAINS)))
+        """
         # 挑战通过有延迟, 428 时重试 (最多 4 次, 每次等 6s)
         result = None
         for attempt in range(4):
@@ -681,13 +633,10 @@ class TmailInbox:
     适合对域名不敏感的平台, 或作为免费备选源。
     """
 
-    def __init__(self, proxies: Any = None, shared: bool = False):
+    def __init__(self, proxies: Any = None):
         self.base_url = "https://mail.sunls.de"
         self.proxies = proxies
         self.email = ""
-        # shared=True: один браузер на весь процесс (переиспользуется между
-        # регистрациями, close() — no-op). Иначе — прежнее поведение.
-        self.shared = shared
         self._page = None
         self._browser = None
         self._pw = None
@@ -738,8 +687,7 @@ class TmailInbox:
         except Exception as e:
             raise RuntimeError(f"Tmail: не удалось запустить браузерную сессию: {e}") from e
 
-    def _reset(self):
-        """Тихо прибить браузер (после падения), следующий вызов перезапустит."""
+    def close(self):
         async def _close():
             if self._browser is not None:
                 try:
@@ -751,66 +699,47 @@ class TmailInbox:
                     await self._pw.stop()
                 except Exception:
                     pass
+
         if self._loop is not None and not self._loop.is_closed():
             try:
                 self._run(_close(), timeout=30)
+            except Exception:
+                pass
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
             except Exception:
                 pass
         self._browser = None
         self._page = None
         self._pw = None
 
-    def close(self):
-        if self.shared:
-            # общий браузер живёт весь процесс; закрывать нельзя
-            return
-        self._reset()
-        if self._loop is not None and not self._loop.is_closed():
-            try:
-                self._loop.call_soon_threadsafe(self._loop.stop)
-            except Exception:
-                pass
-
     def create_email(self):
-        """浏览器内拿域名池 + случайный адрес. Браузер общий (shared) или свой.
-        При падении страницы — один тихий перезапуск и повтор.
-        Домены из blacklist (коды не доходят) исключаются на каждом вызове."""
+        """浏览器内拿域名池 + 随机拼地址, 返回 (token_like, email)。"""
+        self._get_page()
         js = """
         async () => {
-            const BAD = __BAD__;
             const dr = await fetch("/api/domain");
             const dj = await dr.json();
             if (dj.code !== 0 || !(dj.data || []).length) return {err: "no domains"};
-            let doms = dj.data.filter(d => !BAD.includes(d));
-            if (!doms.length) doms = dj.data;
             const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
             let prefix = "";
             for (let i = 0; i < 10; i++) prefix += chars[Math.floor(Math.random() * 36)];
-            const email = prefix + "@" + doms[Math.floor(Math.random() * doms.length)];
+            const email = prefix + "@" + dj.data[Math.floor(Math.random() * dj.data.length)];
             return {email};
         }
-        """.replace("__BAD__", json.dumps(sorted(_TMAIL_BAD_DOMAINS)))
-        result = None
-        for _attempt in range(2):
-            try:
-                self._get_page()
-                result = self._run(self._page.evaluate(js), timeout=60)
-                break
-            except Exception as e:
-                # страница умерла (браузер упал/CF переопрос) — пересоздать разово
-                self._reset()
-                if _attempt:
-                    raise RuntimeError(f"Tmail: не удалось создать почту: {e}") from e
+        """
+        try:
+            result = self._run(self._page.evaluate(js), timeout=60)
+        except Exception as e:
+            raise RuntimeError(f"Tmail: не удалось создать почту: {e}") from e
         if not isinstance(result, dict) or result.get("err") or not result.get("email"):
             raise RuntimeError(f"Tmail: не удалось создать почту: {result}")
         self.email = str(result["email"])
         return {"provider": "tmail", "token": self.email, "email": self.email, "client": self}, self.email
 
-    def fetch_first_email(self, email: Optional[str] = None) -> Optional[str]:
-        """Опрос /api/fetch?to={addr} в контексте живой страницы.
-        Явный адрес (для общего браузера: несколько потоков читают свои ящики)."""
-        addr = email or self.email
-        if not addr or self._page is None:
+    def fetch_first_email(self) -> Optional[str]:
+        """轮询 /api/fetch?to={addr}&limit=30, 返回邮件文本 (subject+body)。"""
+        if not self.email or self._page is None:
             return None
         js = """
         async (email) => {
@@ -826,7 +755,7 @@ class TmailInbox:
         }
         """
         try:
-            result = self._run(self._page.evaluate(js, addr), timeout=60)
+            result = self._run(self._page.evaluate(js, self.email), timeout=60)
         except Exception:
             return None
         if not result:
@@ -1152,18 +1081,216 @@ class GmailIMAPClient:
         self._imap = None
 
 
+
+class GenericIMAPInbox:
+    """Generic IMAP mailbox — any provider (custom domain, Yandex, t-online, etc).
+
+    Env: IMAP_HOST (required), IMAP_PORT (default 993), IMAP_USER (required),
+         IMAP_PASS (required), IMAP_SSL (default 1), IMAP_ALIAS_MODE (plus|dot|none, default plus).
+
+    plus: user+tag@domain   dot: u.ser@domain   none: fixed address (single use)
+    Polls IMAP INBOX for new UIDs, extracts xAI code from body.
+    """
+
+    def __init__(self, proxies: Any = None):
+        import imaplib
+        self._imaplib = imaplib
+        self.proxies = proxies
+        self.host = str(os.getenv("IMAP_HOST") or "").strip()
+        self.port = int(os.getenv("IMAP_PORT") or 993)
+        self.user = str(os.getenv("IMAP_USER") or "").strip()
+        self.password = str(os.getenv("IMAP_PASS") or "").strip()
+        self.use_ssl = str(os.getenv("IMAP_SSL", "1")) not in ("0", "false", "no")
+        self.alias_mode = str(os.getenv("IMAP_ALIAS_MODE", "plus")).strip().lower()
+        self.email = ""
+        self._imap = None
+        self._baseline_uid = 0
+        if not (self.host and self.user and self.password):
+            raise RuntimeError("IMAP_HOST / IMAP_USER / IMAP_PASS required for imap provider")
+
+    def _connect(self):
+        if self._imap is not None:
+            try:
+                self._imap.noop(); return
+            except Exception:
+                self._imap = None
+        cls = self._imaplib.IMAP4_SSL if self.use_ssl else self._imaplib.IMAP4
+        self._imap = cls(self.host, self.port)
+        self._imap.login(self.user, self.password)
+        self._imap.select("INBOX")
+        # baseline: remember max UID so only NEW mail counts
+        typ, data = self._imap.uid("SEARCH", None, "ALL")
+        uids = (data[0] or b"").split()
+        self._baseline_uid = int(uids[-1]) if uids else 0
+
+    def create_email(self):
+        self._connect()
+        base = self.user
+        if self.alias_mode == "plus" and "@" in base:
+            local, dom = base.split("@", 1)
+            tag = "".join(random.choice(_string.ascii_lowercase + _string.digits) for _ in range(8))
+            self.email = f"{local}+{tag}@{dom}"
+        elif self.alias_mode == "dot" and "@" in base:
+            local, dom = base.split("@", 1)
+            import random as _r
+            pos = _r.randint(1, max(1, len(local) - 1))
+            self.email = f"{local[:pos]}.{local[pos:]}@{dom}"
+        else:
+            self.email = base
+        return {"provider": "imap", "client": self, "email": self.email}, self.email
+
+    def fetch_first_email(self) -> Optional[str]:
+        """Poll INBOX for messages newer than baseline; return body text."""
+        import email as _email_mod
+        if self._imap is None:
+            try: self._connect()
+            except Exception: return None
+        try:
+            self._imap.noop()
+            typ, data = self._imap.uid("SEARCH", None, "ALL")
+            uids = [int(u) for u in (data[0] or b"").split()]
+            new = [u for u in uids if u > self._baseline_uid]
+            if not new: return None
+            for uid in new[:10]:
+                typ, msgdata = self._imap.uid("FETCH", str(uid), "(RFC822)")
+                if not msgdata or not msgdata[0]: continue
+                raw = msgdata[0][1]
+                msg = _email_mod.message_from_bytes(raw)
+                # alias filter: To must contain our tag (plus mode)
+                if self.alias_mode == "plus" and "+" in self.email:
+                    to = str(msg.get("To") or "")
+                    tag = self.email.split("+", 1)[1].split("@")[0]
+                    if tag not in to: continue
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() in ("text/plain", "text/html"):
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                body += payload.decode("utf-8", errors="replace") + "\n"
+                else:
+                    payload = msg.get_payload(decode=True)
+                    if payload: body = payload.decode("utf-8", errors="replace")
+                subject = str(msg.get("Subject") or "")
+                if body or subject:
+                    return subject + "\n" + body
+            return None
+        except Exception as e:
+            print(f"[IMAP] poll error: {e}")
+            self._imap = None
+            return None
+
+    def close(self):
+        try:
+            if self._imap is not None: self._imap.logout()
+        except Exception: pass
+        self._imap = None
+
+
+class OneSecMailInbox:
+    """1secmail.com — pure REST API temp mail, no browser, no keys.
+
+    GET https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1
+    GET https://www.1secmail.com/api/v1/?action=getMessages&login=X&domain=Y
+    GET https://www.1secmail.com/api/v1/?action=readMessage&login=X&domain=Y&id=N
+    Note: shared domains — strict platforms may reject; good as cheap fallback.
+    """
+
+    BASE = "https://www.1secmail.com/api/v1/"
+
+    def __init__(self, proxies: Any = None):
+        self.proxies = proxies or {}
+        self.email = ""
+        self._login = ""
+        self._domain = ""
+
+    def _get(self, params: dict, timeout=30):
+        import urllib.parse
+        url = self.BASE + "?" + urllib.parse.urlencode(params)
+        r = requests.get(url, proxies=self.proxies, timeout=timeout,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        return r.json()
+
+    def create_email(self):
+        data = self._get({"action": "genRandomMailbox", "count": "1"})
+        if not data: raise RuntimeError("1secmail: empty gen response")
+        self.email = str(data[0])
+        self._login, self._domain = self.email.split("@", 1)
+        return {"provider": "1secmail", "client": self, "email": self.email}, self.email
+
+    def fetch_first_email(self) -> Optional[str]:
+        if not self._login: return None
+        try:
+            msgs = self._get({"action": "getMessages", "login": self._login, "domain": self._domain})
+            if not msgs: return None
+            mid = msgs[0].get("id")
+            full = self._get({"action": "readMessage", "login": self._login, "domain": self._domain, "id": str(mid)})
+            if not isinstance(full, dict): return None
+            return str(full.get("subject") or "") + "\n" + str(full.get("textBody") or full.get("htmlBody") or "")
+        except Exception as e:
+            print(f"[1secmail] poll error: {e}")
+            return None
+
+    def close(self):
+        pass
+
+
+
+class TempMailLolInbox:
+    """tempmail.lol v2 — pure REST API temp mail, no browser, no keys.
+
+    POST https://api.tempmail.lol/v2/inbox/create -> {token, address}
+    GET  https://api.tempmail.lol/v2/inbox/auth?token=X -> {emails:[{subject,body,...}]}
+    NOTE: v2 token goes in QUERY param, not Bearer header.
+    """
+
+    BASE = "https://api.tempmail.lol/v2"
+
+    def __init__(self, proxies: Any = None):
+        self.proxies = proxies or {}
+        self.email = ""
+        self._token = ""
+
+    def create_email(self):
+        r = requests.post(f"{self.BASE}/inbox/create", proxies=self.proxies, timeout=30,
+                          headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        d = r.json()
+        self._token = d.get("token") or ""
+        self.email = d.get("address") or ""
+        if not (self._token and self.email):
+            raise RuntimeError(f"tempmail.lol: bad create response: {d}")
+        return {"provider": "tempmail-lol", "client": self, "email": self.email}, self.email
+
+    def fetch_first_email(self) -> Optional[str]:
+        if not self._token: return None
+        try:
+            r = requests.get(f"{self.BASE}/inbox", params={"token": self._token},
+                             proxies=self.proxies, timeout=30,
+                             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+            r.raise_for_status()
+            if not r.text.strip().startswith("{"): return None
+            d = r.json()
+            emails = d.get("emails") or []
+            if not emails: return None
+            m = emails[0]
+            return str(m.get("subject") or "") + "\n" + str(m.get("body") or m.get("html_body") or "")
+        except Exception as e:
+            print(f"[tempmail.lol] poll error: {e}")
+            return None
+
+    def close(self):
+        pass
+
+
 class EmailService:
     """统一邮箱服务门面，兼容旧调用方"""
-
-    # общий Tmail-браузер на процесс (tmail = единственный браузерный
-    # провайдер по умолчанию; один Chromium вместо одного на регистрацию)
-    _TMAIL_SHARED: Optional["TmailInbox"] = None
-    _TMAIL_LOCK = threading.Lock()
 
     def __init__(self, proxies: Any = None, provider: str = "luckmail"):
         self.proxies = proxies
         self.provider = str(provider or os.getenv("EMAIL_PROVIDER") or "luckmail").strip().lower()
-        if self.provider not in {"gptmail", "mailtm", "luckmail", "mailnest", "gmail", "tmail", "fce", "outlook"}:
+        if self.provider not in {"gptmail", "mailtm", "luckmail", "mailnest", "gmail", "tmail", "fce", "outlook", "imap", "1secmail", "tempmail-lol"}:
             raise ValueError(f"неподдерживаемый почтовый провайдер: {self.provider}")
 
     def create_email(self):
@@ -1220,11 +1347,7 @@ class EmailService:
                 return None, None
         elif self.provider == "tmail":
             try:
-                # один браузер Tmail на весь процесс: лениво, под замком
-                with EmailService._TMAIL_LOCK:
-                    if EmailService._TMAIL_SHARED is None:
-                        EmailService._TMAIL_SHARED = TmailInbox(self.proxies, shared=True)
-                    client = EmailService._TMAIL_SHARED
+                client = TmailInbox(self.proxies)
                 token_like, email = client.create_email()
                 print(f"[+] создан email Tmail: {email}")
                 return token_like, email
@@ -1249,6 +1372,33 @@ class EmailService:
             except Exception as e:
                 print(f"[Error] ошибка запроса Outlook: {e}")
                 return None, None
+        elif self.provider == "imap":
+            try:
+                client = GenericIMAPInbox(self.proxies)
+                token_like, email = client.create_email()
+                print(f"[+] создан IMAP-алиас: {email}")
+                return token_like, email
+            except Exception as e:
+                print(f"[Error] ошибка IMAP: {e}")
+                return None, None
+        elif self.provider == "1secmail":
+            try:
+                client = OneSecMailInbox(self.proxies)
+                token_like, email = client.create_email()
+                print(f"[+] создан email 1secmail: {email}")
+                return token_like, email
+            except Exception as e:
+                print(f"[Error] ошибка 1secmail: {e}")
+                return None, None
+        elif self.provider == "tempmail-lol":
+            try:
+                client = TempMailLolInbox(self.proxies)
+                token_like, email = client.create_email()
+                print(f"[+] создан email tempmail.lol: {email}")
+                return token_like, email
+            except Exception as e:
+                print(f"[Error] ошибка tempmail.lol: {e}")
+                return None, None
         # gptmail: 使用 V2 API
         try:
             client = GPTMailInboxV2(self.proxies)
@@ -1270,10 +1420,7 @@ class EmailService:
             if not client:
                 return None
 
-            if provider == "tmail":
-                # общий браузер: явный адрес, чтобы потоки не читали чужие ящики
-                return client.fetch_first_email(token_like.get("email"))
-            elif provider in ("mailtm", "luckmail", "gptmail-v2", "gmail", "fce", "outlook"):
+            if provider in ("mailtm", "luckmail", "gptmail-v2", "gmail", "tmail", "fce", "outlook", "imap", "1secmail", "tempmail-lol"):
                 return client.fetch_first_email()
             elif provider == "mailnest":
                 return client.fetch_first_email(token_like.get("email"))

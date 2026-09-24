@@ -43,7 +43,7 @@ SECRET_KEYS = ("G2A_KEY", "G2A_ADMIN_PASS", "YESCAPTCHA_KEY", "CAPSOLVER_KEY", "
                "LUCKMAIL_API_KEY", "LUCKMAIL_API_SECRET", "MAILNEST_API_KEY", "FCE_API_KEY")
 
 ENUM_KEYS = {
-    "email.provider": {"tmail", "luckmail", "mailnest", "fce", "gptmail", "gmail", "outlook"},
+    "email.provider": {"tmail", "luckmail", "mailnest", "fce", "gptmail", "gmail", "outlook", "imap", "1secmail", "tempmail-lol"},
     "captcha.mode": {"free_browser", "yescaptcha", "capsolver", "nopecha", "2captcha"},
     "proxy.mode": {"direct", "single", "pool"},
 }

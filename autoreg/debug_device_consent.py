@@ -2,7 +2,7 @@
 检查设备 consent 页面的按钮
 """
 import sys, time, json
-sys.path.insert(0, "D:/ruyipage")
+if os.path.isdir("D:/ruyipage"): sys.path.insert(0, "D:/ruyipage")
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from ruyipage import FirefoxPage, FirefoxOptions

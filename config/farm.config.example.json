@@ -13,7 +13,7 @@
   },
   "email": {
     "provider": "tmail",
-    "//provider": "tmail | luckmail | mailnest | fce | gptmail | gmail | outlook. fce = pure API no browser. gmail = +alias from one base mailbox. tmail/gptmail need headed Chrome.",
+    "//provider": "tmail | luckmail | mailnest | fce | gptmail | gmail | outlook | imap | 1secmail | tempmail-lol. fce = pure API no browser. gmail = +alias from one base mailbox. tmail/gptmail need headed Chrome.",
     "tmail": {},
     "luckmail": {
       "api_key_env": "LUCKMAIL_API_KEY",
@@ -36,6 +36,12 @@
     "outlook": {
       "accounts_file": "./mailboxes/outlook-accounts.txt",
       "//": "line format: email----password----clientId----refreshToken----auto"
+    },
+    "imap": {
+      "//": "generic IMAP via env: IMAP_HOST IMAP_PORT IMAP_USER IMAP_PASS IMAP_SSL IMAP_ALIAS_MODE(plus|dot|none)"
+    },
+    "1secmail": {
+      "//": "pure REST API, no keys needed. shared domains - fallback only"
     }
   },
   "captcha": {

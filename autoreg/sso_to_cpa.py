@@ -2,7 +2,6 @@
 SSO -> CPA PKCE 转换器
 用 curl_cffi 走完整 PKCE 流程，包括 OAuth consent 表单提交
 """
-import ca_fix  # CA-бандл в ASCII-путь: кириллица в пути проекта ломает curl_cffi (curl 77)
 import json, os, sys, time, hashlib, base64, secrets, urllib.parse, argparse, re
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -18,7 +17,7 @@ AUTHORIZE_URL = "https://auth.x.ai/oauth2/authorize"
 SCOPE = "openid profile email offline_access grok-cli:access api:access"
 PROXY = os.getenv("GROK_PROXY") or ""
 if sys.platform == "win32":
-    AUTH_DIR = os.getenv("CPA_AUTHS_DIR") or "D:/CLIProxyAPIPlus/auths"
+    AUTH_DIR = os.getenv("CPA_AUTHS_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "auths")
 else:
     AUTH_DIR = os.getenv("CPA_AUTHS_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "auths")
 KEYS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keys")
@@ -180,7 +179,7 @@ def _handle_consent(sess, location, sso_token, code_verifier, email=""):
     Windows: ruyipage (Firefox) browser flow; other platforms: pure-HTTP form submit.
     """
     try:
-        sys.path.insert(0, "D:/ruyipage")
+        if os.path.isdir("D:/ruyipage"): sys.path.insert(0, "D:/ruyipage")
 
         from ruyipage import FirefoxPage, FirefoxOptions
     except ImportError:
