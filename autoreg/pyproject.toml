@@ -1,0 +1,15 @@
+[project]
+name = "grok-register"
+version = "0.1.0"
+description = "Grok (x.ai) 自动注册脚本"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4",
+    "camoufox[geoip]>=0.5.6",
+    "curl_cffi",
+    "drissionpage>=4.1.1.4",
+    "patchright>=1.61.2",
+    "python-dotenv",
+    "requests",
+]

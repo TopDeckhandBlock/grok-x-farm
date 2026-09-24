@@ -160,7 +160,7 @@ def cmd_doctor(_a):
 
 # ---------- reg / import ----------
 def find_reg_dir():
-    for cand in (os.getenv("REG_DIR", ""), os.path.join(HERE, "grok-auto"),
+    for cand in (os.getenv("REG_DIR", ""), os.path.join(HERE, "autoreg"), os.path.join(HERE, "grok-auto"),
                  os.path.join(HERE, "grok-register"), r"C:\Users\User\grok-reg\grok-auto"):
         if cand and (os.path.exists(os.path.join(cand, "keys")) or os.path.exists(os.path.join(cand, "grok_auto.py"))):
             return cand

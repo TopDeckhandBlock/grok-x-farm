@@ -1,0 +1,39 @@
+"""一次性重铸 4 个被撤销的 xai OAuth token (2026-08-13)"""
+import os, sys, json, time
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault("GROK_PROXY", "http://127.0.0.1:7891")  # nexitally 干净 IP
+
+from device_mint import sso_to_device
+from sso_to_cpa import save_auth
+
+NEED = [e.strip() for e in os.getenv("REMINT_EMAILS", "").split(",") if e.strip()]
+
+# 从 accounts.txt 读 SSO (带 BOM)
+sso_map = {}
+with open(os.path.join(os.path.dirname(__file__), "keys/accounts.txt"),
+          encoding="utf-8-sig") as f:
+    for line in f.read().splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3:
+            sso_map[parts[0]] = ":".join(parts[2:])
+
+ok, fail = 0, 0
+for email in NEED:
+    sso = sso_map.get(email, "")
+    if not sso:
+        print(f"[SKIP] {email}: no SSO in accounts.txt")
+        fail += 1
+        continue
+    print(f"\n=== reminting: {email} ===")
+    result = sso_to_device(sso, email)
+    if result:
+        save_auth(email, result)
+        print(f"[OK] {email} written to auths/")
+        ok += 1
+    else:
+        print(f"[FAIL] {email} minting failed")
+        fail += 1
+    time.sleep(5)
+
+print(f"\ndone: OK={ok} FAIL={fail}")
