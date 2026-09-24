@@ -204,23 +204,56 @@ def register_single_thread(email_provider: str = "gptmail"):
                         res = session.post(f"{site_url}/sign-up", json=payload, headers=headers)
                     
                     if res.status_code == 200:
-                        # 尝试多种 SSO 提取方式
                         sso = None
-                        # 方式1: set-cookie?q= URL (老格式)
-                        for pat in [
-                            r'(https://[^"\s]+set-cookie\?q=[^:"\s]+)',
-                            r'(https://[^"\s]+set-cookie[^"\s]+)',
-                        ]:
-                            m = re.search(pat, res.text)
-                            if m:
-                                sso_url = m.group(0).rstrip("1:").rstrip("2:").rstrip("3:")
+                        _txt = res.text.replace("\\/", "/").replace("\\u0026", "&")
+
+                        def _grab_sso(urls):
+                            """GET set-cookie URL'ы; sso из curl-jar, иначе std-requests fallback (grokipedia TLS)."""
+                            import requests as _std
+                            for u in urls:
                                 try:
-                                    session.get(sso_url, allow_redirects=True, timeout=15)
-                                except:
+                                    session.get(u, allow_redirects=True, timeout=15)
+                                except Exception:
                                     pass
-                                sso = session.cookies.get("sso")
-                                if sso:
-                                    break
+                                v = session.cookies.get("sso")
+                                if v:
+                                    return v
+                                try:
+                                    rs = _std.get(u, allow_redirects=True, timeout=15, headers={"user-agent": user_agent})
+                                    for ck in list(rs.cookies) + [c for h in rs.history for c in h.cookies]:
+                                        if ck.name == "sso" and ck.value:
+                                            return ck.value
+                                except Exception:
+                                    pass
+                            return None
+
+                        # 方式0a (актуальный формат): auth.* set-cookie URL в RSC-потоке (после unescape)
+                        sso = _grab_sso(re.findall(r'https://auth\.[^"\'\s\\]+?/set-cookie\?q=[A-Za-z0-9_.\-]+', _txt))
+                        # 方式0b: cookie-chain JWT -> hops[].href
+                        if not sso:
+                            import base64 as _b64
+                            chain_urls = []
+                            for tok in re.findall(r'eyJ[A-Za-z0-9_\-]{80,}', _txt):
+                                try:
+                                    j = json.loads(_b64.urlsafe_b64decode(tok + "=" * (-len(tok) % 4)))
+                                    if isinstance(j, dict) and j.get("kind") == "cookie-chain":
+                                        chain_urls += [h["href"] for h in j.get("hops", []) if h.get("href")]
+                                except Exception:
+                                    pass
+                            if chain_urls:
+                                sso = _grab_sso(chain_urls)
+                        # 方式1: set-cookie?q= URL (老格式)
+                        if not sso:
+                            for pat in [
+                                r'(https://[^"\s]+set-cookie\?q=[^:"\s]+)',
+                                r'(https://[^"\s]+set-cookie[^"\s]+)',
+                            ]:
+                                m = re.search(pat, _txt)
+                                if m:
+                                    sso_url = m.group(0).rstrip("1:").rstrip("2:").rstrip("3:")
+                                    sso = _grab_sso([sso_url])
+                                    if sso:
+                                        break
                         # 方式2: 直接从 response cookies 取
                         if not sso:
                             sso = session.cookies.get("sso")
